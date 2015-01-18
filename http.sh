@@ -1,4 +1,4 @@
-#!env bash
+#!/usr/bin/env bash
 set -e
 set -u
 
@@ -11,38 +11,11 @@ http_log() {
 }
 
 http_log_request() {
-	local request="$(cat -)"
-	local http_params=($(http_parse_request "$request"))
-	local method="${http_params[0]}"
-	local host="${http_params[1]}"
-	local path="${http_params[2]}"
-	local query="${http_params[3]-}"
-	http_log "$host: $method $path $query"
-	echo -e "$request"
+	http_log "${Request[Method]} ${Request[Path]} ${Request[Proto]}"
 }
 
 http_log_response() {
-	local response="$(cat -)"
-	local header=( $(echo -e "$response" | head -n 1) )
-	http_log "> ${header[@]:1}"
-	echo -e "$response"
-}
-
-http_is_request() {
-	local request="$1"
-	local methods="GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS"
-	egrep -q "^($methods) /[^ ]* HTTP/1\.1" <<< "$request"
-}
-
-http_parse_request() {
-	local request="$1"
-	local header="$(echo -e "$request" | grep '^GET ')"
-	local method="$(echo "$header" | cut -d ' ' -f 1)"
-	local route="$(echo "$header" | cut -d ' ' -f 2)"
-	local path="$(echo "$route?" | cut -d '?' -f 1)"
-	local query="$(echo "$route?" | cut -d '?' -f 2)"
-	local host="$(echo -e "$request" | grep 'Host: ' | cut -d ' ' -f 2)"
-	echo "$method" "$host" "$path" "$query"
+	http_log "${Response[Status]}"
 }
 
 http_server_date() {
@@ -54,68 +27,96 @@ http_content_length() {
 	echo $(wc -c <<< "$body")
 }
 
-http_response() {
-	local status="$1"
-	local body="$2"
-	echo "HTTP/1.1 $status"
-	echo "Date: $(http_server_date)"
-	echo "Server: $HTTP_SERVER_BANNER"
-	echo "Content-Length: $(http_content_length "$body")"
-	echo "Connection: close"
-	echo
-	echo "$body"
+http_accept_request() {
+	local method url proto
+	read -r method url proto
+	if [[ ! $method =~ (OPTIONS|HEAD|GET|POST|PUT|PATCH|DELETE) ]]; then
+		echo 'Bad method'
+		return 1
+	elif [[ -z $url ]]; then
+		echo 'Bad route'
+		return 2
+	elif [[ ! $proto =~ (HTTP/1\.0|HTTP/1\.1) ]]; then
+		echo 'Bad protocol'
+		return 3
+	fi
+	Request[Method]="$method"
+	Request[Path]="$url"
+	Request[Proto]=$(echo "$proto" | tr -d '\r\n')
 }
 
-http_bad_request() {
-	local status='400 BAD REQUEST'
-	local body='Bad request.'
-	http_response "$status" "$body"
+http_parse_headers() {
+	local header value handled
+	while read -r header value; do
+		header=$(echo "$header" | tr -d '\r\n')
+		[[ -z $header ]] && break
+		[[ ! $header =~ :$ ]] && continue
+		Request["${header/:/}"]=$(echo "$value" | tr -d '\r\n')
+	done
 }
 
 http_accept() {
-	local method url proto headers
-	read -r method url proto
-	while read -r line; do
-		line="$(echo $line | tr -d '[\r\n]')"
-		[[ -z "$line" ]] && break;
-		headers+="$line\n"
-	done
-	echo -e "$method $url $proto\n$headers"
+	http_accept_request
+	http_parse_headers
 }
 
 http_dispatch() {
-	local request="$(cat -)"
-	if ! http_is_request "$request"; then
-		http_bad_request
-	else
-		local http_params="$(http_parse_request "$request")"
-		default_route $http_params
-	fi
+	local routes="$1"
+	while read -r route handler; do
+		[[ -z $route ]] && continue
+		if [[ $route =~ ^${Request[Path]}/?$ ]]; then
+			$handler
+			return 0
+		fi
+	done <<<"$routes"
+	http_404 # Default handler
 }
 
-http_middleware() {
-	http_accept \
-	| http_log_request \
-	| http_dispatch \
-	| http_log_response
+http_respond() {
+	local proto="${Response[Proto]-HTTP/1.1}"
+	local status="${Response[Status]-200 OK}"
+	local body="${Response[Body]-}"
+	Response[Date]="$(http_server_date)"
+	Response[Server]="$HTTP_SERVER_BANNER"
+	Response[Content-Length]="$(http_content_length "$body")"
+	Response[Connection]="close"
+	#
+	echo "$proto $status"
+	for header in "${!Response[@]}"; do
+		[[ $header =~ ^(Proto|Status|Body)$ ]] && continue
+		echo "$header: ${Response[$header]}"
+	done
+	echo -e "\n$body"
 }
 
-http_listen() {
-	local address="$1"
-	local port="$2"
-	rm -f outcoming
-	mkfifo outcoming
-	trap "rm -f outcoming" EXIT
-	cat outcoming | nc -w 1 -l "$address" "$port" > >(
-		http_middleware > outcoming
-	)
-	rm -f outcoming
+http_404() {
+	Response[Status]='404 NOT FOUND'
+}
+
+http_pipeline() {
+	declare -A Request
+	declare -A Response
+	http_accept
+	http_log_request
+	http_dispatch "$routes"
+	http_respond
+	http_log_response
 }
 
 http_serve() {
 	local address="$1"
 	local port="$2"
+	local routes="$3"
+	local request_counter=0
+	trap "rm -f .request*" EXIT
 	while true; do
-		http_listen "$address" "$port"
+		local out_pipe=".request.$request_counter"
+		request_counter=$(($request_counter + 1))
+		#
+		mkfifo "$out_pipe"
+		cat "$out_pipe" | nc -l "$address" "$port" > >(
+			http_pipeline > "$out_pipe"
+		)
+		rm -f "$out_pipe"
 	done
 }

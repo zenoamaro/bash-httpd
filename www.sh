@@ -1,22 +1,28 @@
 #!env bash
 source http.sh
 
-default_route() {
-	local method="$1"
-	local host="${2-}"
-	local path="$3"
-	local query="${4-}"
-http_response "200 OK" "<h1>It works!</h1>
-<ul>
-	<li>Method: $method</li>
-	<li>Host: $host</li>
-	<li>Path: $path</li>
-	<li>Query: $query</li>
-</ul>
+index_route() {
+	Response[Status]="200 OK"
+	Response[Body]="<h1>It works!</h1>
+<a href='detail'>Click here for details.</a>
 <hr>
 <em>$HTTP_SERVER_BANNER</em>"
 }
 
-while true; do
-	http_serve 0.0.0.0 8081
-done
+detail_route() {
+	Response[Status]="200 OK"
+	Response[Body]="<h1>Details:</h1>
+<ul>
+	<li>Method: ${Request[Method]}</li>
+	<li>Host:   ${Request[Host]}</li>
+	<li>Path:   ${Request[Path]}</li>
+</ul>
+<a href='/'>Back</a>
+<hr>
+<em>$HTTP_SERVER_BANNER</em>"
+}
+
+http_serve 0.0.0.0 8081 '
+	/ index_route
+	/detail detail_route
+'
